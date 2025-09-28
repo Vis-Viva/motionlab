@@ -6,27 +6,6 @@
 
 #include "tier0/memdbgon.h"
 
-// -----------------------------------------------------------------------------------------------
-// Module-scope constants
-// -----------------------------------------------------------------------------------------------
-namespace {
-    // Numeric constants
-    constexpr float MIN_VEL         = 0.1f;
-    constexpr float STEP_EPS        = DIST_EPSILON;
-    constexpr float GROUND_MIN_DOT  = 0.7f;
-    constexpr float VERT_PROBE_DIST = 2.0f;
-    constexpr float OVERCLIP        = 1.001f;
-    constexpr int   MAX_BUMPS       = 4;
-
-    // Direction constants
-    static const Vector WORLD_UP   ( 0.0f,  0.0f,  1.0f );
-    static const Vector WORLD_DOWN ( 0.0f,  0.0f, -1.0f );
-}
-
-// Client movement speed CVARs are replicated; shared/server code can read them via extern.
-extern ConVar cl_forwardspeed;
-extern ConVar cl_backspeed;
-
 MotionDriver::MotionDriver()  = default;
 MotionDriver::~MotionDriver() = default;
 
@@ -128,8 +107,8 @@ void MotionDriver::UpdateMovementAxes()
 {
 	// Ugly native Source names stay here for engine compatibility, don't use these
 	AngleVectors( mv->m_vecViewAngles, &m_vecForward, &m_vecRight, &m_vecUp );
-	// Use these instead - same values, much better names
-	AngleVectors( mv->m_vecViewAngles, &ForwardMoveAxis, &RightMoveAxis, &UpMoveAxis );
+	// PlayerState is the preferred way to interface with move axes
+	MLPlayer.UpdateMovementAxes();
 }
 
 
@@ -147,40 +126,9 @@ bool MotionDriver::PlayerIsStuck()
 }
 
 
-void MotionDriver::ResetPlayerFriction( void )
-{
-	player->m_surfaceFriction = 1.0f;  // Default value
-}
-
-
-const Vector& MotionDriver::GetCurrentPos() const
-{
-	return mv->GetAbsOrigin();  // IT'S SO UGLY
-}
-
-
-const Vector& MotionDriver::GetCurrentVel() const
-{
-	return mv->m_vecVelocity;  // AAAAAAAAAAAAA
-}
-
-
-float MotionDriver::GetCurrentSpeed() const
-{
-	return GetCurrentVel().Length()
-}
-
-
 bool MotionDriver::TraceHitEntity( const hulltrace& tr ) const
 {
 	return tr.m_pEnt != NULL;  // dude
-}
-
-
-// Pointer to actual ground entity player is standing on, not just an identifier
-CBaseEntity* MotionDriver::GetPlayerGroundEntity() const
-{
-    return player->GetGroundEntity();
 }
 
 
@@ -196,28 +144,14 @@ surfacedata* MotionDriver::GetTraceSurfaceData( const hulltrace& tr ) const
 }
 
 
-// Phys material identifier for surface player was on coming into this tick
-char MotionDriver::GetPlayerPrevTextureType() const
-{
-	return player->m_chPreviousTextureType;
-}
-
-
-// Update current surface material ID so next tick can check it
-void MotionDriver::SetPlayerTextureType( char newTextureType )
-{
-	player->m_chPreviousTextureType = newTextureType;
-}
-
-
 // If player's standing surface material has changed, update it for any surface triggers that consume it
 void MotionDriver::UpdatePlayerGameMaterial( const hulltrace& groundTr )
 {
 	surfacedata *currentSrfData = GetTraceSurfaceData( groundTr );
 	char         currentGameMat = currentSrfData ? currentSrfData->game.material : 0;
-	char         prevGameMat    = GetPlayerPrevTextureType();
+	char         prevGameMat    = MLPlayer.PreviousTextureType();
 
-	if ( GetPlayerGroundEntity() == NULL )
+	if ( MLPlayer.CurrentGroundEntity() == NULL )
 	{
 		currentGameMat = 0;
 	}
@@ -228,7 +162,7 @@ void MotionDriver::UpdatePlayerGameMaterial( const hulltrace& groundTr )
 		CEnvPlayerSurfaceTrigger::SetPlayerSurface( player, currentGameMat );
 	}
 
-	SetPlayerTextureType( currentGameMat );
+	MLPlayer.UpdateTextureType( currentGameMat );
 }
 
 
@@ -246,24 +180,25 @@ CBaseEntity* MotionDriver::GetTraceCollisionEntity( const hulltrace* tr ) const
 
 
 // Modifies player base velocity appropriately when landing/leaving ground
+// TODO: Make this a PlayerState method probably?
 void MotionDriver::HandleGroundTransitionVel( CBaseEntity* oldGround, CBaseEntity* newGround )
 {
-	Vector currentBaseVel = player->GetBaseVelocity();
+	Vector newBaseVel = MLPlayer.CurrentBaseVelocity();
 
 	if ( !oldGround && newGround )
 	{
 		// Subtract ground velocity at instant we hit ground
-		currentBaseVel  -= newGround->GetAbsVelocity();
-		currentBaseVel.z = newGround->GetAbsVelocity().z;
+		newBaseVel  -= newGround->GetAbsVelocity();
+		newBaseVel.z = newGround->GetAbsVelocity().z;
 	}
 	else if ( oldGround && !newGround )
 	{
 		// Add in ground velocity at instant we started jumping
-		currentBaseVel  += oldGround->GetAbsVelocity();
-		currentBaseVel.z = oldGround->GetAbsVelocity().z;
+		newBaseVel  += oldGround->GetAbsVelocity();
+		newBaseVel.z = oldGround->GetAbsVelocity().z;
 	}
 
-	player->SetBaseVelocity( currentBaseVel );
+	MLPlayer.UpdateBaseVelocity( newBaseVel );
 }
 
 
@@ -277,24 +212,25 @@ float MotionDriver::GetTraceFriction( const hulltrace* tr ) const
 }
 
 
-// Store ground properties and set jump gate for movement logic later
+// Store ground properties & set jump gate for force calculation later
+// TODO: Make these trace util funcs standalones in ml_defs and move this whole function to PlayerState
 void MotionDriver::UpdateGrounding( const hulltrace* groundTr )
 {
 	// Not grounded
 	if ( !groundTr || !TraceHitEntity( *groundTr ) )
 	{
-		CurrentGroundFriction = 1.0f;
-		CurrentGroundNormal   = WORLD_UP;
-		PlayerIsGrounded      = false;
-		PlayerCanJump         = false;
+		MLPlayer.CurrentGroundFriction = 1.0f;
+		MLPlayer.CurrentGroundNormal   = WORLD_UP;
+		MLPlayer.IsGrounded            = false;
+		MLPlayer.CanJump               = false;
 		return;
 	}
 
 	// Trace found standable ground (NOTE: Normal has already been checked by now)
-	CurrentGroundFriction = GetTraceFriction( groundTr );
-	CurrentGroundNormal   = groundTr->plane.normal;
-	PlayerIsGrounded      = true;
-	PlayerCanJump         = true;
+	MLPlayer.CurrentGroundFriction = GetTraceFriction( groundTr );
+	MLPlayer.CurrentGroundNormal   = groundTr->plane.normal;
+	MLPlayer.IsGrounded            = true;
+	MLPlayer.CanJump               = true;
 }
 
 
@@ -304,16 +240,17 @@ bool MotionDriver::RegisterTouch( const hulltrace& tr, const Vector& collisionVe
 }
 
 
-// Does typical Source grounding ops, minus the zeroing of z vel and with some ML stuff added
+// Does typical Source grounding ops, minus the zeroing of z vel, plus some ML-specific stuff
+// TODO: Make this a PlayerState method probably??
 void MotionDriver::SetGroundEntity( const hulltrace *groundTr )
 {
 	UpdateGrounding( groundTr );  // ML-specific logic
 
-	CBaseEntity *oldGround = GetPlayerGroundEntity();
+	CBaseEntity *oldGround = MLPlayer.CurrentGroundEntity();
 	CBaseEntity *newGround = GetTraceCollisionEntity( groundTr );
 	
 	HandleGroundTransitionVel( oldGround, newGround );
-	player->SetGroundEntity( newGround );
+	MLPlayer.UpdateGroundEntity( newGround );
 
 	// If we are on something, categorize surface and record touch
 	if ( newGround && groundTr )
@@ -324,7 +261,7 @@ void MotionDriver::SetGroundEntity( const hulltrace *groundTr )
 		// Signal that we touched an object if we're standing on a non-world entity
 		if ( !groundTr->DidHitWorld() ) 
 		{
-				RegisterTouch( *groundTr, GetCurrentVel() );
+				RegisterTouch( *groundTr, MLPlayer.CurrentVelocity() );
 		}
 
 		//mv->m_vecVelocity.z = 0.0f;
@@ -337,16 +274,16 @@ void MotionDriver::CategorizePosition( void )
 {
 
 	// Reset friction to default every time we recategorize (prevents bogus friction in certain edge cases)
-	ResetPlayerFriction();
+	MLPlayer.ResetFriction();
 
 	// observers don't have a ground entity
-	if ( player->IsObserver() )
+	if ( MLPlayer.IsObserver() )
 	{
 		return;
 	}
 
 	// Initial simple short downward trace
-	Vector    currentPos = GetCurrentPos();
+	Vector    currentPos = MLPlayer.CurrentPosition();
 	Vector 	  endPoint   = Vector( currentPos.x, currentPos.y, currentPos.z - VERT_PROBE_DIST );
 	hulltrace groundTr;
 	TryTouchGround( currentPos, endPoint, GetPlayerMins(), GetPlayerMaxs(), 
@@ -381,110 +318,26 @@ void MotionDriver::CategorizePosition( void )
 }
 
 
-// Have to keep track of this for various things unrelated to movement
-void MotionDriver::RecordFallVelocity()
-{
-	if ( GetPlayerGroundEntity() == NULL )
-	{
-		player->m_Local.m_flFallVelocity = -mv->m_vecVelocity[ 2 ];
-	}
-}
-
-
-// Source chores
-void MotionDriver::UpdatePlayerStepSound()
-{
-	player->UpdateStepSound( player->m_pSurfaceData, mv->GetAbsOrigin(), mv->m_vecVelocity );
-}
-
-
 // Last bit of tick-entry engine housekeeping
 void MotionDriver::MoreSpaghettiContainment()
 {
-	RecordFallVelocity();
+	MLPlayer.RecordFallVelocity();
 	m_nOnLadder = 0;
-	UpdatePlayerStepSound();
-}
-
-
-// Normalized forward-axis input ∈ [-1, 1] from current movedata
-float MotionDriver::GetForwardAxisInput() const
-{
-	if ( !mv )
-		return 0.0f;
-
-	const float fwdMove   = mv->m_flForwardMove;  // Natively ∈ [-cl_backspeed, cl_forwardspeed] 
-	const bool  isForward = ( fwdMove >= 0.0f );
-	const float denom     = isForward ? cl_forwardspeed.GetFloat() : cl_backspeed.GetFloat();
-	if ( denom <= 0.0f )
-		return 0.0f;
-
-	float axis = fwdMove / denom;  // Negative automatically preserved for back input
-	return clamp( axis, -1.0f, 1.0f );
-}
-
-
-// Normalized side-axis input ∈ [-1, 1] from current movedata  
-float MotionDriver::GetSideAxisInput() const
-{
-	if ( !mv )
-		return 0.0f;
-
-	const float sideMove = mv->m_flSideMove;  // Natively ∈ [-cl_sidespeed, cl_sidespeed]
-	const float denom    = cl_sidespeed.GetFloat();
-	if ( denom <= 0.0f )
-		return 0.0f;
-
-	float axis = sideMove / denom;
-	return clamp( axis, -1.0f, 1.0f );
-}
-
-
-bool MotionDriver::GetJumpInput() const
-{
-	return mv->m_nButtons & IN_JUMP;
-}
-
-
-// Project vector onto plane: v_projected = v - (v · n̂) * n̂
-void MotionDriver::VectorPlaneProjection( const Vector& v, const Vector& planeNormal, Vector& out ) const
-{
-	out = v - (planeNormal * DotProduct( v, planeNormal ));
-}
-
-
-void MotionDriver::VectorRescale( Vector& v, const float targetLength ) const
-{
-	VectorNormalize( v );
-	v *= targetLength;
-}
-
-
-// Placeholder. Eventually mass will be a property of the player's build
-float MotionDriver::GetPlayerMass() const
-{
-	return 100.0f;  // TODO: Tune this value
-}
-
-
-// Placeholder. Eventually jump force magnitude will be a property of the player's build
-float MotionDriver::GetPlayerJumpForce() const
-{
-	return 1.0f;  // TODO: Tune this value
+	MLPlayer.UpdateStepSound();
 }
 
 
 // Amount of upward velocity we get by applying one tick of jump force
 float MotionDriver::GetJumpImpulseVel() const
 {
-	return ( GetPlayerJumpForce() / GetPlayerMass() ) * FRAMETIME;
+	return ( MLPlayer.JumpForce / MLPlayer.Mass ) * FRAMETIME;
 }
 
 
 // Source VPhys bookkeeping - update serverside phys shadow to match player jumps
 void MotionDriver::VPhysJump()
 {
-	if( PlayerCanJump && GetJumpInput() )
+	if( MLPlayer.CanJump && GetJumpInput() )
 	{
 		mv->m_outJumpVel.z  += GetJumpImpulseVel();
 		mv->m_outStepHeight += 0.15f;
@@ -492,176 +345,28 @@ void MotionDriver::VPhysJump()
 }
 
 
-// Placeholder. Eventually drag coefficient will be a property of the player's build
-float MotionDriver::GetPlayerDragCoeff() const
-{
-	return 1.0f;  // TODO: Tune this value
-}
-
-
-// Quadratic air drag: F_drag = -k * |v|² * v̂
-void MotionDriver::CalcAirDrag()
-{
-	CurrentDragForce.Init();
-	Vector currentVel   = GetCurrentVel();
-	float  currentSpeed = currentVel.Length();
-	if ( currentSpeed > 0.0f )
-	{
-		float  dragMag   = GetPlayerDragCoeff() * (currentSpeed * currentSpeed);
-		Vector dragDir   = currentVel * -1.0f;
-		VectorNormalize( dragDir )
-		CurrentDragForce = dragDir * dragMag;
-	}
-}
-
-
-// Kinetic friction: f = μN
-void MotionDriver::CalcFriction()
-{
-	CurrentFrictionForce.Init();
-	if ( PlayerIsGrounded )
-	{
-		// Project velocity onto ground plane
-		Vector currentVel = GetCurrentVel();
-		Vector tangentV;
-		VectorPlaneProjection( currentVel, CurrentGroundNormal, tangentV );
-		float  tanSpeed   = tangentV.Length();
-		if ( tanSpeed > 0.0f )
-		{
-			// Normal force: N = m*g*cos(θ), cos(θ) = n̂⋅up
-			float m    = GetPlayerMass();
-			float nDot = DotProduct( CurrentGroundNormal, WORLD_UP );
-			float N    = m * GetCurrentGravity() * nDot;
-			float f    = CurrentGroundFriction * N;   // Friction magnitude: f = μN
-			float fMax = (tanSpeed * m) / FRAMETIME;  // Force that will stop the player
-			f = MIN( f, fMax );                       // Prevent friction from reversing vel
-			
-			// Apply friction in opposite direction to surface velocity
-			Vector fDir = tangentV * -1.0f;
-			VectorNormalize( fDir )
-			CurrentFrictionForce = f * fDir;
-		}
-	}
-}
-
-
-// TODO: Should the 0-speed checks here be MIN_VEL instead?
-void MotionDriver::CalcResistForce()
-{
-	CurrentResistForce.Init();
-	CalcAirDrag();   // Applies always
-	CalcFriction();  // Only applies while grounded
-	CurrentResistForce = CurrentDragForce + CurrentFrictionForce;
-}
-
-
-// Placeholder. Eventually boost force magnitude will be a property of the player's build
-float MotionDriver::GetPlayerBoostForce()
-{
-	return 1.0f;  // TODO: Tune this value
-}
-
-
-// Compute planar input force from WASD
-void MotionDriver::CalcPlanarDrivers()
-{
-	CurrentWASDForce.Init();
-	Vector inputDir  = (ForwardMoveAxis * GetForwardAxisInput()) + (RightMoveAxis * GetSideAxisInput());
-	float  inputMag  = inputDir.Length();
-	
-	if ( inputMag > 0.0f )
-	{
-		if ( inputMag > 1.0f )
-		{
-			VectorNormalize( inputDir );
-		}
-		
-		CurrentWASDForce = inputDir * GetPlayerBoostForce();
-		
-		// Project onto ground plane if grounded, otherwise keep horizontal
-		if ( PlayerIsGrounded )
-		{
-			VectorPlaneProjection( CurrentWASDForce, CurrentGroundNormal, CurrentWASDForce );
-			VectorRescale( CurrentWASDForce, GetPlayerBoostForce() );  // prevent projection slowdown on slopes
-		}
-	}
-}
-
-
-void MotionDriver::CalcVerticalDrivers()
-{
-	CurrentGravForce.Init();  // only applied when airborne
-	CurrentJumpForce.Init();  // only applied when grounded
-
-	if ( PlayerIsGrounded )
-	{
-		if ( PlayerCanJump && GetJumpInput() )
-		{
-			CurrentJumpForce = WORLD_UP * GetPlayerJumpForce();
-			VPhysJump();  // Source vphys bookkeeping
-			//PlayerCanJump = false; Dunno if we want to do this yet
-		}
-	}
-	else
-	{
-		CurrentGravForce = WORLD_DOWN * (GetCurrentGravity() * GetPlayerMass());
-	}
-}
-
-
-void MotionDriver::CalcDriveForce()
-{
-	CurrentDriveForce.Init();
-	CalcPlanarDrivers();
-	CalcVerticalDrivers();
-	CurrentDriveForce = CurrentWASDForce + CurrentJumpForce + CurrentGravForce;
-}
-
-
-void MotionDriver::CalcCurrentForces()
-{
-	CurrentNetForce.Init();
-	CalcResistForce();
-	CalcDriveForce(); 
-	CurrentNetForce = CurrentDriveForce + CurrentResistForce;  // Resist is already < 0, hence +
-}
-
-
 // Source VPhys bookkeeping - update planar push force serverside phys shadow applies to props
 void MotionDriver::UpdateVPhysVel()
 {
 	Vector wishForce   = CurrentWASDForce + CurrentFrictionForce; wishForce.z = 0.0f;
-	Vector wishAccel   = wishForce / GetPlayerMass();
+	Vector wishAccel   = wishForce / MLPlayer.Mass;
 	Vector wishDelta   = wishAccel * FRAMETIME;
 	mv->m_outWishVel  += wishDelta;
 	mv->m_outWishVel.z = 0.0f;
 }
 
 
-// Satanic function
-void MotionDriver::ZeroVelocity()
-{
-	mv->m_vecVelocity.Zero();
-}
-
-
-void MotionDriver::UpdateVelocity( const Vector& newVel )
-{
-	mv->m_vecVelocity = newVel;
-}
-
-
 // F = ma -> a = F/m -> dv = a*dt
 void MotionDriver::Accelerate()
 {
-	Vector acceleration = CurrentNetForce * ( 1.0f / GetPlayerMass() );
+	Vector acceleration = CurrentNetForce * ( 1.0f / MLPlayer.Mass );
 	Vector deltaVel     = acceleration * FRAMETIME;
-	Vector newVel       = GetCurrentVel() + deltaVel;
+	Vector newVel       = MLPlayer.CurrentVelocity() + deltaVel;
 	if ( newVel.Length() < MIN_VEL )
 	{
 		newVel.Zero();  // do not do Zeno paradox
 	}
-	UpdateVelocity( newVel );	
+	MLPlayer.UpdateVelocity( newVel );	
 }
 
 
@@ -685,12 +390,6 @@ bool MotionDriver::CheckTraceStuck( const hulltrace& tr ) const
 bool MotionDriver::CheckSlideTraceInvalid( const hulltrace& slideTr ) const
 {
 	return ( slideTr.allsolid || ( slideTr.fraction == 1.0f && CheckTraceStuck( slideTr ) ) );
-}
-
-
-void MotionDriver::UpdatePosition( const Vector& newPos )
-{
-	mv->SetAbsOrigin( newPos );
 }
 
 
@@ -721,8 +420,8 @@ bool MotionDriver::Slide()
 	float  totalFraction    = 0.0f;
 	float  timeLeft         = FRAMETIME;
 	bool   cleanSlide       = true;
-	Vector originalStartVel = GetCurrentVel();
-	Vector segmentStartVel  = GetCurrentVel();
+	Vector originalStartVel = MLPlayer.CurrentVelocity();
+	Vector segmentStartVel  = MLPlayer.CurrentVelocity();
 	
 	for ( int bumpCount=0; bumpCount < MAX_BUMPS; bumpCount++ )
 	{
@@ -733,14 +432,14 @@ bool MotionDriver::Slide()
 		
 		hulltrace slideTr;
 		Vector    endPos; 
-		VectorMA( GetCurrentPos(), timeLeft, GetCurrentVel(), endPos );
-		TracePlayerMovementBBox( GetCurrentPos(), endPos, slideTr );
+		VectorMA( MLPlayer.CurrentPosition(), timeLeft, MLPlayer.CurrentVelocity(), endPos );
+		TracePlayerMovementBBox( MLPlayer.CurrentPosition(), endPos, slideTr );
 		totalFraction += slideTr.fraction;
 
 		// First make sure we can actually use this trace for a slide
 		if ( CheckSlideTraceInvalid( slideTr ) )
 		{
-			ZeroVelocity();  // :(
+			MLPlayer.ZeroVelocity();  // :(
 			cleanSlide = false;
 			break;
 		}
@@ -748,18 +447,18 @@ bool MotionDriver::Slide()
 		// Ok the trace is usable, now what does it tell us?
 		if ( slideTr.fraction > 0.0f )  // hooray we went somewhere
 		{
-			UpdatePosition( slideTr.endpos );
+			MLPlayer.UpdatePosition( slideTr.endpos );
 			if ( slideTr.fraction == 1.0f )  // We made it all the way to the end, we're done
 			{
 				break;
 			}
 			// Only made it part way, get ready to handle collisions
 			planeNormals.RemoveAll();
-			segmentStartVel = GetCurrentVel();
+			segmentStartVel = MLPlayer.CurrentVelocity();
 		}
 		
 		// Didn't break above, must have bumped into something - record touch and handle collision
-		RegisterTouch( slideTr, GetCurrentVel() );          // Source bookkeeping for vphys, surface triggers, etc
+		RegisterTouch( slideTr, MLPlayer.CurrentVelocity() );          // Source bookkeeping for vphys, surface triggers, etc
 		float timeTravelled = timeLeft * slideTr.fraction;  // Amount of timestep consumed before collision
 		timeLeft           -= timeTravelled;
 		cleanSlide          = false;
@@ -768,7 +467,7 @@ bool MotionDriver::Slide()
 		// Hit too many planes - we're stuck, zero vel & return false - this shouldn't really happen but whatev
 		if ( planeNormals.Count() >= MAX_CLIP_PLANES )
 		{
-			ZeroVelocity();
+			MLPlayer.ZeroVelocity();
 			break;
 		}
 
@@ -812,7 +511,7 @@ bool MotionDriver::Slide()
 			}
 			else  // We're hitting > 2 planes, prob stuck in a corner, zero vel and be sad
 			{
-				ZeroVelocity();
+				MLPlayer.ZeroVelocity();
 				break;
 			}
 		}
@@ -820,26 +519,20 @@ bool MotionDriver::Slide()
 		// Guard against velocity reversal from deflections to prevent oscillations in corners
 		if ( DotProduct( newVel, originalStartVel ) <= 0.0f )
 		{
-			ZeroVelocity();
+			MLPlayer.ZeroVelocity();
 			break;
 		}
 		
-		UpdateVelocity( newVel );  // Apply deflected velocity and continue
+		MLPlayer.UpdateVelocity( newVel );  // Apply deflected velocity and continue
 	}
 
 	// No progress across all bumps => no movement => sad
 	if ( totalFraction <= 0.0f )
 	{
-		ZeroVelocity();
+		MLPlayer.ZeroVelocity();
 	}
 
 	return cleanSlide;
-}
-
-
-float MotionDriver::GetPlayerStepHeight() const
-{
-	return player->GetStepHeight();
 }
 
 
@@ -855,21 +548,21 @@ void MotionDriver::TraceStep( const Vector& start, float signedDist, hulltrace& 
 void MotionDriver::StayOnGround( void )
 {
 	// Trace up to find safe starting position (mitigates ground clipping and float noise)
-	Vector    currentPos = GetCurrentPos();
+	Vector    currentPos = MLPlayer.CurrentPosition();
 	hulltrace upTr;
 	TraceStep( currentPos, VERT_PROBE_DIST, upTr );
 	Vector    safeStart  = upTr.endpos;
 	
 	// Trace down one step to find ground
 	hulltrace dnTr;
-	TraceStep( safeStart, -GetPlayerStepHeight(), dnTr );
+	TraceStep( safeStart, -MLPlayer.StepHeight(), dnTr );
 	
 	// If downward trace found a standable surface, snap to it
 	if ( 0.0f < dnTr.fraction && dnTr.fraction < 1.0f && !dnTr.startsolid && PlaneIsStandable( dnTr.plane ) )
 	{
 		if ( fabs( currentPos.z - dnTr.endpos.z ) > 0.5f * COORD_RESOLUTION )
 		{
-			UpdatePosition( dnTr.endpos );
+			MLPlayer.UpdatePosition( dnTr.endpos );
 		}
 	}
 }
@@ -885,23 +578,23 @@ void MotionDriver::VPhysStep( float stepHeight )
 void MotionDriver::Step( const Vector& preSlidePos, const Vector& preSlideVel )
 {
 	// Unstepped slide results from upstream
-	Vector straightSlideEndPos = GetCurrentPos();
-	Vector straightSlideEndVel = GetCurrentVel();
+	Vector straightSlideEndPos = MLPlayer.CurrentPosition();
+	Vector straightSlideEndVel = MLPlayer.CurrentVelocity();
 	float  straightSlideDist   = (straightSlideEndPos - preSlidePos).Length2D();
 	
 	// Reset to starting state for step-up attempt
-	UpdatePosition( preSlidePos );
-	UpdateVelocity( preSlideVel );
+	MLPlayer.UpdatePosition( preSlidePos );
+	MLPlayer.UpdateVelocity( preSlideVel );
 
 	// Now try stepping up to get around whatever the unstepped slide bumped into
 	hulltrace stepUpTr;
-	float     stepSize = GetPlayerStepHeight() + STEP_EPS;
+	float     stepSize = MLPlayer.StepHeight() + STEP_EPS;
 	TraceStep( preSlidePos, stepSize, stepUpTr );
 
 	// If step-up succeeded, move to stepped position
 	if ( !stepUpTr.startsolid && !stepUpTr.allsolid )
 	{
-		UpdatePosition( stepUpTr.endpos );
+		MLPlayer.UpdatePosition( stepUpTr.endpos );
 	}
 
 	// Slide over obstacle from current position
@@ -909,14 +602,14 @@ void MotionDriver::Step( const Vector& preSlidePos, const Vector& preSlideVel )
 	
 	// Trace downward to return to ground level
 	hulltrace stepDownTr;
-	TraceStep( GetCurrentPos(), -stepSize, stepDownTr );
+	TraceStep( MLPlayer.CurrentPosition(), -stepSize, stepDownTr );
 	
 	// Check if step-down landed on non-standable ground
 	if ( stepDownTr.fraction < 1.0f && !PlaneIsStandable( stepDownTr.plane ) )
 	{
 		// Landed on steep surface - reject stepped path, use straight slide
-		UpdatePosition( straightSlideEndPos );
-		UpdateVelocity( straightSlideEndVel );
+		MLPlayer.UpdatePosition( straightSlideEndPos );
+		MLPlayer.UpdateVelocity( straightSlideEndVel );
 		
 		float slideZ = straightSlideEndPos.z - preSlidePos.z;
 		if ( slideZ > 0.0f )
@@ -929,28 +622,28 @@ void MotionDriver::Step( const Vector& preSlidePos, const Vector& preSlideVel )
 	// Step-down trace valid, update position to endpoint
 	if ( !stepDownTr.startsolid && !stepDownTr.allsolid )
 	{
-		UpdatePosition( stepDownTr.endpos );
+		MLPlayer.UpdatePosition( stepDownTr.endpos );
 	}
 	
 	// Which path moved further?
-	Vector steppedSlideEndPos = GetCurrentPos();
-	Vector steppedSlideEndVel = GetCurrentVel();
+	Vector steppedSlideEndPos = MLPlayer.CurrentPosition();
+	Vector steppedSlideEndVel = MLPlayer.CurrentVelocity();
 	float  steppedSlideDist   = (steppedSlideEndPos - preSlidePos).Length2D();
 	
 	if ( straightSlideDist > steppedSlideDist )  // original unstepped slide got us further
 	{
-		UpdatePosition( straightSlideEndPos );
-		UpdateVelocity( straightSlideEndVel );
+		MLPlayer.UpdatePosition( straightSlideEndPos );
+		MLPlayer.UpdateVelocity( straightSlideEndVel );
 	}
 	else  // stepped slide got further but have to make sure stepping doesn't screw with our z vel
 	{
 		Vector finalVel = steppedSlideEndVel;
 		finalVel.z = straightSlideEndVel.z;
-		UpdateVelocity( finalVel );
+		MLPlayer.UpdateVelocity( finalVel );
 	}
 	
 	// Record final step height offset
-	float stepZ = GetCurrentPos().z - preSlidePos.z;
+	float stepZ = MLPlayer.CurrentPosition().z - preSlidePos.z;
 	if ( stepZ > 0.0f )
 	{
 		VPhysStep( stepZ );
@@ -960,12 +653,12 @@ void MotionDriver::Step( const Vector& preSlidePos, const Vector& preSlideVel )
 
 void MotionDriver::Move()
 {
-	Vector startPos = GetCurrentPos();
-	Vector startVel = GetCurrentVel();
+	Vector startPos = MLPlayer.CurrentPosition();
+	Vector startVel = MLPlayer.CurrentVelocity();
 
 	if ( Slide() )
 	{
-		if ( PlayerIsGrounded )
+		if ( MLPlayer.IsGrounded )
 		{
 			StayOnGround();
 		}
@@ -973,7 +666,7 @@ void MotionDriver::Move()
 	}
 
 	Step( startPos, startVel );
-	if ( PlayerIsGrounded )
+	if ( MLPlayer.IsGrounded )
 	{
 		StayOnGround();
 	}
@@ -983,8 +676,7 @@ void MotionDriver::Move()
 // Per-tick entry point Source override. This is where we divert from Source's pipeline into ours.
 void MotionDriver::PlayerMove()
 {
-	ClearState();                // Make sure we start with a clean state the current player/tick
-	SetConfig();                 // Give us a nice interface for a bunch of engine parameters
+	TickSetup();
 	SpaghettiContainment();      // Blood sacrifices for Gaben, keep the engine happy
 	UpdateMovementAxes();        // Set current fwd, right, up axes based on player view dir
 	if ( PlayerIsStuck() )
