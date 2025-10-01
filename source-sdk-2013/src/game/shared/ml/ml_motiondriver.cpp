@@ -6,6 +6,13 @@
 
 #include "tier0/memdbgon.h"
 
+#ifndef CLIENT_DLL
+	#include "env_player_surface_trigger.h"
+#endif
+
+using namespace motionlab;
+
+
 MotionDriver::MotionDriver()  = default;
 MotionDriver::~MotionDriver() = default;
 
@@ -77,10 +84,13 @@ void MotionDriver::CheckParameters( void )
 // ------------------------------------------------------------------------------------------------
 
 
-// Reset various fields to defaults so we start with a clean state, no contamination between players/ticks
-void MotionDriver::ClearState()
+// Tick entry stuff
+void MotionDriver::TickSetup()
 {
-	// TODO: Implement me once we know exactly what needs to be reset/cleared
+	FRAMETIME = gpGlobals->frametime;
+	PlayerInputs.Setup( mv );
+	MLPlayer.Setup( mv,player );
+	FCalc.Setup( &PlayerInputs, &MLPlayer, FRAMETIME );
 }
 
 
@@ -107,7 +117,7 @@ void MotionDriver::UpdateMovementAxes()
 {
 	// Ugly native Source names stay here for engine compatibility, don't use these
 	AngleVectors( mv->m_vecViewAngles, &m_vecForward, &m_vecRight, &m_vecUp );
-	// PlayerState is the preferred way to interface with move axes
+	// MLPlayer is the preferred way to interface with move axes
 	MLPlayer.UpdateMovementAxes();
 }
 
@@ -144,7 +154,8 @@ surfacedata* MotionDriver::GetTraceSurfaceData( const hulltrace& tr ) const
 }
 
 
-// If player's standing surface material has changed, update it for any surface triggers that consume it
+// On serverside, ff player standing surface material has changed, update it for any listening srf triggers
+#ifndef CLIENT_DLL
 void MotionDriver::UpdatePlayerGameMaterial( const hulltrace& groundTr )
 {
 	surfacedata *currentSrfData = GetTraceSurfaceData( groundTr );
@@ -156,7 +167,6 @@ void MotionDriver::UpdatePlayerGameMaterial( const hulltrace& groundTr )
 		currentGameMat = 0;
 	}
 
-	// Changed?
 	if ( prevGameMat != currentGameMat )
 	{
 		CEnvPlayerSurfaceTrigger::SetPlayerSurface( player, currentGameMat );
@@ -164,6 +174,7 @@ void MotionDriver::UpdatePlayerGameMaterial( const hulltrace& groundTr )
 
 	MLPlayer.UpdateTextureType( currentGameMat );
 }
+#endif
 
 
 // Is this plane horizontal enough to stand on?
@@ -180,7 +191,7 @@ CBaseEntity* MotionDriver::GetTraceCollisionEntity( const hulltrace* tr ) const
 
 
 // Modifies player base velocity appropriately when landing/leaving ground
-// TODO: Make this a PlayerState method probably?
+// TODO: Make this a MLPlayer method probably?
 void MotionDriver::HandleGroundTransitionVel( CBaseEntity* oldGround, CBaseEntity* newGround )
 {
 	Vector newBaseVel = MLPlayer.CurrentBaseVelocity();
@@ -213,7 +224,7 @@ float MotionDriver::GetTraceFriction( const hulltrace* tr ) const
 
 
 // Store ground properties & set jump gate for force calculation later
-// TODO: Make these trace util funcs standalones in ml_defs and move this whole function to PlayerState
+// TODO: Make these trace util funcs standalones in ml_defs and move this whole function to MLPlayer
 void MotionDriver::UpdateGrounding( const hulltrace* groundTr )
 {
 	// Not grounded
@@ -241,7 +252,7 @@ bool MotionDriver::RegisterTouch( const hulltrace& tr, const Vector& collisionVe
 
 
 // Does typical Source grounding ops, minus the zeroing of z vel, plus some ML-specific stuff
-// TODO: Make this a PlayerState method probably??
+// TODO: Make this a MLPlayer method probably??
 void MotionDriver::SetGroundEntity( const hulltrace *groundTr )
 {
 	UpdateGrounding( groundTr );  // ML-specific logic
@@ -327,28 +338,15 @@ void MotionDriver::MoreSpaghettiContainment()
 }
 
 
-// Amount of upward velocity we get by applying one tick of jump force
-float MotionDriver::GetJumpImpulseVel() const
+// Record keeping to sync serverside physics shadow with player once we've done movement calcs
+void MotionDriver::SyncVPhys()
 {
-	return ( MLPlayer.JumpForce / MLPlayer.Mass ) * FRAMETIME;
-}
-
-
-// Source VPhys bookkeeping - update serverside phys shadow to match player jumps
-void MotionDriver::VPhysJump()
-{
-	if( MLPlayer.CanJump && GetJumpInput() )
+	if ( FCalc.PlayerJumped )
 	{
-		mv->m_outJumpVel.z  += GetJumpImpulseVel();
+		mv->m_outJumpVel.z  += MLPlayer.JumpImpulseVel( FRAMETIME );
 		mv->m_outStepHeight += 0.15f;
 	}
-}
-
-
-// Source VPhys bookkeeping - update planar push force serverside phys shadow applies to props
-void MotionDriver::UpdateVPhysVel()
-{
-	Vector wishForce   = CurrentWASDForce + CurrentFrictionForce; wishForce.z = 0.0f;
+	Vector wishForce   = FCalc.CurrentWASDForce + FCalc.CurrentFrictionForce; wishForce.z = 0.0f;
 	Vector wishAccel   = wishForce / MLPlayer.Mass;
 	Vector wishDelta   = wishAccel * FRAMETIME;
 	mv->m_outWishVel  += wishDelta;
@@ -359,7 +357,7 @@ void MotionDriver::UpdateVPhysVel()
 // F = ma -> a = F/m -> dv = a*dt
 void MotionDriver::Accelerate()
 {
-	Vector acceleration = CurrentNetForce * ( 1.0f / MLPlayer.Mass );
+	Vector acceleration = FCalc.CurrentNetForce / MLPlayer.Mass;
 	Vector deltaVel     = acceleration * FRAMETIME;
 	Vector newVel       = MLPlayer.CurrentVelocity() + deltaVel;
 	if ( newVel.Length() < MIN_VEL )
@@ -394,7 +392,7 @@ bool MotionDriver::CheckSlideTraceInvalid( const hulltrace& slideTr ) const
 
 
 // Deflect velocity along plane indicated by normal
-Vector MotionDriver::DeflectVelocity( const Vector& currentVel, const Vector& normal, float overbounce )
+Vector MotionDriver::DeflectVelocity( const Vector& currentVel, const Vector& normal, float overbounce ) const
 {
 	// Determine how far along plane to deflect based on incoming direction
 	float  intoSurface = DotProduct( currentVel, normal );
@@ -416,7 +414,7 @@ Vector MotionDriver::DeflectVelocity( const Vector& currentVel, const Vector& no
 bool MotionDriver::Slide()
 {
 	// Accumulate collision plane normals to constrain velocity redirections
-	CUtlVectorFixed<Vector, MAX_CLIP_PLANES> planeNormals;
+	CUtlVectorFixed<Vector, MAX_CLIPS> planeNormals;
 	float  totalFraction    = 0.0f;
 	float  timeLeft         = FRAMETIME;
 	bool   cleanSlide       = true;
@@ -425,7 +423,7 @@ bool MotionDriver::Slide()
 	
 	for ( int bumpCount=0; bumpCount < MAX_BUMPS; bumpCount++ )
 	{
-		if ( GetCurrentSpeed() == 0.0f )  // nothing to slide if we're not moving
+		if ( MLPlayer.CurrentVelocity().Length() == 0.0f )  // nothing to slide if we're not moving
 		{
 			break;
 		}
@@ -465,7 +463,7 @@ bool MotionDriver::Slide()
 		Vector bumpNormal   = slideTr.plane.normal;
 
 		// Hit too many planes - we're stuck, zero vel & return false - this shouldn't really happen but whatev
-		if ( planeNormals.Count() >= MAX_CLIP_PLANES )
+		if ( planeNormals.Count() >= MAX_CLIPS )
 		{
 			MLPlayer.ZeroVelocity();
 			break;
@@ -568,7 +566,7 @@ void MotionDriver::StayOnGround( void )
 }
 
 
-// Move serverside physics shadow to match player steps
+// Serverside physics shadow has to step when the player does
 void MotionDriver::VPhysStep( float stepHeight )
 {
 	mv->m_outStepHeight += stepHeight;
@@ -635,10 +633,10 @@ void MotionDriver::Step( const Vector& preSlidePos, const Vector& preSlideVel )
 		MLPlayer.UpdatePosition( straightSlideEndPos );
 		MLPlayer.UpdateVelocity( straightSlideEndVel );
 	}
-	else  // stepped slide got further but have to make sure stepping doesn't screw with our z vel
+	else  // stepped slide got further 
 	{
 		Vector finalVel = steppedSlideEndVel;
-		finalVel.z = straightSlideEndVel.z;
+		finalVel.z = straightSlideEndVel.z;  // guard against stepping causing phantom z vel
 		MLPlayer.UpdateVelocity( finalVel );
 	}
 	
@@ -676,9 +674,10 @@ void MotionDriver::Move()
 // Per-tick entry point Source override. This is where we divert from Source's pipeline into ours.
 void MotionDriver::PlayerMove()
 {
-	TickSetup();
-	SpaghettiContainment();      // Blood sacrifices for Gaben, keep the engine happy
-	UpdateMovementAxes();        // Set current fwd, right, up axes based on player view dir
+	// Initial tick housekeeping
+	TickSetup();                 // Initialize interfaces and reset force calculator state
+	SpaghettiContainment();      // Engine stuff, not our business
+	UpdateMovementAxes();        // Set force application axes from player view dir
 	if ( PlayerIsStuck() )
 	{
 		return;
@@ -686,15 +685,16 @@ void MotionDriver::PlayerMove()
 	CategorizePosition();        // Update grounding status, friction/material values etc
 	MoreSpaghettiContainment();  // More engine housekeeping, nothing to do with us
 	
-	CalcCurrentForces();         // Calculate & store all force vectors acting on the player
-	UpdateVPhysVel();            // Yet more housekeeping for downstream engine ops
+	// Actual movement stuff
+	FCalc.CalcCurrentForces();   // Calculate & store all force vectors acting on the player
+	SyncVPhys();                 // Yet more housekeeping for downstream engine ops
 	Accelerate();                // Modify player velocity according to current forces
 	Move();                      // Modify player position according to current velocity
 }
 
 
 // Expose MotionDriver as the IGameMovement provider (mirrors Valve pattern)
-static MotionDriver g_GameMovement;
+static motionlab::MotionDriver g_GameMovement;
 IGameMovement *g_pGameMovement = ( IGameMovement * )&g_GameMovement;
 EXPOSE_SINGLE_INTERFACE_GLOBALVAR( CGameMovement, IGameMovement, INTERFACENAME_GAMEMOVEMENT, g_GameMovement );
 

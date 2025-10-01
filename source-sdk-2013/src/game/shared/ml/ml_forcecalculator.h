@@ -1,36 +1,25 @@
 #pragma once
 
 #include "mathlib/vector.h"
-#include "mathlib/mathlib.h"
-#include "ml_defs.h"
 
 class CBasePlayer;
 class CMoveData;
-class ConVar; // forward declaration for extern ConVars below
 
-// External CVARs
-extern ConVar cl_forwardspeed;
-extern ConVar cl_backspeed;
-extern ConVar cl_sidespeed;
+namespace motionlab {
 
-namespace MotionLab {
-
+class InputReader;
+class MLabPlayer;
+	
 class ForceCalculator 
 {
-	public:  // All of this can be written/read/called by MotionDriver
-		// Tick force calculation vars for current player
-		float        FRAMETIME;
-		Vector       FwdMoveDir;
-		Vector       RightMoveDir;
-		Vector       UpMoveDir;
-		float        CurrentGroundFriction;
-		Vector       CurrentGroundNormal;
-		bool         PlayerIsGrounded;
-		bool         PlayerCanJump;
+	public:
+		ForceCalculator();
+		void  Setup( InputReader* pInput, MLabPlayer* mlPlayer, float frameTime );		
+		float FRAMETIME;
 	
-		// Pointers to current player and movedata being processed
-		CBasePlayer* player;
-		CMoveData*   mv;
+		// Pointer to current player + inputs being processed
+		InputReader* PlayerInput;
+		MLabPlayer*  MLPlayer;
 	
 		// Force calc results stored here for reading downstream
 		Vector       CurrentFrictionForce;
@@ -44,23 +33,12 @@ class ForceCalculator
 		bool         PlayerJumped;  // need to signal this for downstream bookkeeping
 
 		// Public interface
-		void         Reset();
 		void         CalcCurrentForces();
 
 	private:
-		// Helper functions
-		const Vector GetCurrentPlayerPos() const;
-		const Vector GetCurrentPlayerVel() const;
-		float        GetCurrentPlayerSpeed() const;
-		float        GetFwdAxisInput() const;
-		float        GetSideAxisInput() const;
-		bool         GetJumpInput() const;
-		void         VectorPlaneProjection( const Vector& v, const Vector& planeNormal, Vector& out ) const;
+		// Vector math helpers
+		void         VectorProjectOntoPlane( Vector& v, const Vector& planeNormal ) const;
 		void         VectorRescale( Vector& v, const float targetLength ) const;
-		float        GetPlayerMass() const;
-		float        GetPlayerDragCoeff() const;
-		float        GetPlayerBoostForce() const;
-		float        GetPlayerJumpForce() const;
 	
 		// Force calculation methods
 		void         CalcAirDrag();
@@ -71,4 +49,4 @@ class ForceCalculator
 		void         CalcDriveForce();
 };
 
-} // namespace MotionLab
+} // namespace motionlab

@@ -3,20 +3,21 @@
 #include "mathlib/vector.h"
 #include "mathlib/mathlib.h"
 #include "gametrace.h"
-#include "vphysics_interface.h"
-#include "utlvector.h"
-#include "gamemovement.h"
 #include "ml_defs.h"
+#include "ml_inputreader.h"
 #include "ml_player.h"
 #include "ml_forcecalculator.h"
 
 class CBaseEntity;
+
+namespace motionlab {
 
 // We subclass CGameMovement so we can override PlayerMove as our per-tick entry point
 class MotionDriver : public CGameMovement
 {
 private:
 	float           FRAMETIME;
+	InputReader     PlayerInputs;
 	MLabPlayer      MLPlayer;     
 	ForceCalculator FCalc;
 
@@ -31,7 +32,6 @@ private:
 	void          SpaghettiContainment();
 	void          UpdateMovementAxes();
 	bool          PlayerIsStuck();
-    float         GetCurrentSpeed() const;
 	bool          TraceHitEntity( const hulltrace& tr ) const;
 	surfacedata*  GetTraceSurfaceData( const hulltrace& tr ) const;
 	void          UpdatePlayerGameMaterial( const hulltrace& groundTr );
@@ -44,16 +44,12 @@ private:
 	void          SetGroundEntity( const hulltrace *groundTr );
     void          CategorizePosition();
 	void          MoreSpaghettiContainment();
-    void          CalcCurrentForces();
-    bool          GetJumpInput() const;
-	float         GetJumpImpulseVel() const;
-	void          VPhysJump();
-	void          UpdateVPhysVel();
+	void          SyncVPhys();
 	void          Accelerate();
-	void          TracePlayerMovementBBox( const Vector& startPos, const Vector& targetPos, hulltrace& outTr );
+	void          TracePlayerMovementBBox( const Vector& startPos, const Vector& targetPos, hulltrace& outTr ) const;
 	bool          CheckTraceStuck( const hulltrace& tr ) const;
 	bool          CheckSlideTraceInvalid( const hulltrace& tr ) const;
-	Vector        DeflectVelocity( const Vector& currentVel, const Vector& normal, float overbounce );
+	Vector        DeflectVelocity( const Vector& currentVel, const Vector& normal, float overbounce ) const;
 	bool          Slide();
 	void          TraceStep( const Vector& start, float signedDist, hulltrace& tr );
 	void          StayOnGround( void );
@@ -68,3 +64,5 @@ public:
 
 	virtual void PlayerMove() OVERRIDE; // Core override - this is our entry point
 };
+
+} // namespace motionlab
